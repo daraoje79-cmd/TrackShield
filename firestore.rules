@@ -1,0 +1,82 @@
+rules_version = '2';
+
+// TrackShield — Firestore Security Rules
+//
+// Design principles (Section 15 of the MVP plan):
+// 1. Every document is scoped to its owning userId — no user can read or
+//    write another user's data.
+// 2. Financial-integrity fields (balances, categories, fraud flags, alerts)
+//    are written ONLY by Cloud Functions using the Admin SDK, which bypasses
+//    these rules entirely. Clients can READ their own data but cannot WRITE
+//    transactions, category mappings, or alerts directly — this stops a
+//    compromised or malicious client from forging a balance, erasing a
+//    fraud flag, or injecting a fake "allowed" verdict.
+// 3. The blacklist is never exposed to clients. Fraud checks
+//    (/fraud/checkTransfer, /fraud/checkAlertText) run server-side so the
+//    rules the app flags on stay deterministic and explainable, and so the
+//    blacklist itself can't be scraped or tampered with from a client.
+//
+// X1 (Firestore security rules review) should re-verify this file line by
+// line with two test accounts before Day 2 ends.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // users/{userId}
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+
+      // Allow the profile doc to be created on first sign-in, and allow the
+      // user to update their own basic profile fields. Do NOT allow deletion
+      // from the client — account deletion should go through a Cloud
+      // Function so related subcollections can be cleaned up consistently.
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasOnly(['name', 'phone', 'email', 'createdAt', 'guardianContacts']);
+      allow update: if isOwner(userId)
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['name', 'phone', 'email', 'guardianContacts']);
+      allow delete: if false;
+
+      // users/{userId}/transactions/{transactionId}
+      match /transactions/{transactionId} {
+        allow read: if isOwner(userId);
+        // Written only by Cloud Functions (import, categorize, fraud flag).
+        allow create, update, delete: if false;
+      }
+
+      // users/{userId}/categoryMappings/{mappingId}
+      match /categoryMappings/{mappingId} {
+        allow read: if isOwner(userId);
+        // Written by the Cloud Function behind /transactions/:id/categorize
+        // when a user corrects a category — never directly by the client.
+        allow create, update, delete: if false;
+      }
+    }
+
+    // blacklist/{entryId} — global, admin/community-sourced. Never readable
+    // or writable by clients; only Cloud Functions (Admin SDK) touch this.
+    match /blacklist/{entryId} {
+      allow read, write: if false;
+    }
+
+    // alerts/{alertId} — created by Cloud Functions after a fraud check.
+    // Users may read only their own alerts (matched on the userId field).
+    match /alerts/{alertId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create, update, delete: if false;
+    }
+
+    // Deny anything not explicitly matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
